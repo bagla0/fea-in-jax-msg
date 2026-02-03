@@ -551,7 +551,7 @@ def plot_solver_info(opts: SolverOptions, info: SolverResultInfo):
     plt.ylabel("|R|")
     plt.yscale("log")
 
-    cum_iters = np.concat(
+    cum_iters = np.concatenate(
         [
             [0],
             np.cumsum(np.asarray(info.linear_iterations_per_nonlinear_iteration)),

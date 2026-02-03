@@ -1,8 +1,12 @@
 numpy
 numba
 meshio
-jax
-jax[cuda12]
+# CPU-only version
+#jax
+# GPU version with CUDA 12
+#jax[cuda12]
+# GPU version with CUDA 13 (recommended)
+#jax[cuda13]
 jaxopt
 libigl
 matplotlib
@@ -10,3 +14,4 @@ mpi4py
 fenics-basix
 psutil
 cupy-cuda12x
+flax

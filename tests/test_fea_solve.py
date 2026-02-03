@@ -64,7 +64,7 @@ element_batches = [
         n_dofs_per_basis=2,
         connectivity_en=cells,
         constitutive_model=elastic_isotropic,
-        material_params_eqm=mat_params_eqm,
+        material_params=mat_params_eqm,
     )
 ]
 
@@ -77,8 +77,9 @@ u, residual, element_batches = solve_bvp(
     dirichlet_bcs=dirichlet_bcs,
     dirichlet_values=dirichlet_values,
     solver_options=SolverOptions(
-        linear_solve_type=LinearSolverType.SPSOLVE_PYPARDISO,
-        #linear_precond_type=PreconditionerType.JACOBI,
+        #linear_solve_type=LinearSolverType.SPSOLVE_PYPARDISO,
+        linear_precond_type=PreconditionerType.JACOBI,
+        linear_solve_type=LinearSolverType.CG_JAX_SCIPY_W_INFO,
     ),
     plot_convergence=True,
 )

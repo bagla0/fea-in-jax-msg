@@ -22,4 +22,5 @@ def get_fabric(fabric_name: str):
     return os.path.join(os.path.dirname(os.path.realpath(__file__)), 'fabrics', fabric_name, f'{fabric_name}.fab')
 
 def get_output(filename: str):
+    os.makedirs(os.path.dirname(os.path.realpath(__file__)) + '/output', exist_ok=True)
     return os.path.join(os.path.dirname(os.path.realpath(__file__)), 'output', filename)
