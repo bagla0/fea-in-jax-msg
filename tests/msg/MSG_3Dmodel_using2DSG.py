@@ -9,7 +9,7 @@ import time
 np.set_printoptions(precision=5) 
 start = time.time()
 #mesh = meshio.read(get_mesh("microscale_2D_r0.vtk")) 2D_mat1_2elem_tri
-mesh = meshio.read("2D_6144_JAX.msh")
+mesh = meshio.read("UDcomp_2D.msh")
 #mesh = meshio.read("2D_mat1_2elem_tri.msh")
 points = np.array(mesh.points, dtype=np.float32)[:, 0:2]
 cells = np.array(mesh.cells[0].data, dtype=np.uint64)
