@@ -12,7 +12,7 @@ from numba import njit
 from typing import Any
 
 import igl
-
+from scipy.spatial.distance import cdist
 
 @njit
 def uniform_quad_grid(n_rows: int, n_cols: int, bbox):
@@ -153,11 +153,11 @@ def mesh_to_jax_helper(
     vertices: np.ndarray[Any, np.dtype[np.float32|np.float64]],
     cells: np.ndarray[Any, np.dtype[np.uint64]],
 ) -> np.ndarray[Any, np.dtype[np.float32|np.float64]]:
-    x_n = np.zeros((cells.shape[0], cells.shape[1], 2), dtype=vertices.dtype)
+    x_n = np.zeros((cells.shape[0], cells.shape[1], vertices.shape[1]), dtype=vertices.dtype)
     for i in range(cells.shape[0]):
         for j in range(cells.shape[1]):
             # Note: [0:2] is added to ignore z-coordinate if one exists.
-            x_n[i, j] = vertices[cells[i, j]][0:2]
+            x_n[i, j] = vertices[cells[i, j]][0:vertices.shape[1]]
     return x_n
 
 
@@ -386,3 +386,122 @@ def transform_element_node_to_global_nosum(
     )
     return (v_g / n_cell_per_vert[jnp.newaxis, :, jnp.newaxis]).reshape(np.prod(v_g.shape)//v_en.shape[2],v_en.shape[2])
     
+# Added by Akshat for periodic assembly map
+
+def dof_map_full(points, tol=1e-6, ndof_per_node=3):
+    dof_map_disp = periodic_map(points, tol)
+    lambda_indices = jnp.arange(len(dof_map_disp) , 3*points.shape[0]+3 ) 
+    return jnp.concatenate([dof_map_disp, lambda_indices])
+
+def mesh_to_periodic_sparse_assembly_map(
+    V: int,
+    cells: np.ndarray,
+    points: jnp.ndarray,
+    ndof_per_node: int = 3,
+    tol=1e-6,
+    ) -> jsparse.BCSR:
+    dof_map_np = np.array(dof_map_full(points, tol))
+    ndof_per_node=3
+    master_nodes = dof_map_np[:-3][::ndof_per_node] // ndof_per_node
+    master_nodes = master_nodes.astype(np.uint64) 
+    
+    # 3. Create Periodic Connectivity
+    # Replace every slave node in the element definition with its master node
+    periodic_cells = master_nodes[np.array(cells, dtype=np.uint64)]
+    # 4. Build CSR arrays using your existing Numba functions
+    csr_row_ind = build_row_ind(V, periodic_cells) 
+    csr_col_ind, csr_data = build_col_ind_and_data(csr_row_ind, periodic_cells)
+    
+    csr_row_ind = csr_row_ind.reshape(1, -1)
+    csr_col_ind = csr_col_ind.reshape(1, -1)
+    csr_data = csr_data.reshape(1, -1)
+    return jsparse.BCSR(
+            (csr_data, csr_col_ind, csr_row_ind),
+            shape=(1, V, cells.shape[0] * cells.shape[1]),
+            indices_sorted=True,
+            unique_indices=True,
+        ), dof_map_np
+        
+def periodic_map(points, tol=1e-6, ndof_per_node=3):
+    min_xyz = np.min(points, axis=0)
+    max_xyz = np.max(points, axis=0) 
+    num_nodes = len(points)
+    dof_map = np.arange(num_nodes)
+    p=points.shape[1]
+    if p==2:
+        left_points = np.isclose(points[:, 0], min_xyz[0], atol=1e-6).nonzero()[0]
+        right_points = np.isclose(points[:, 0], max_xyz[0], atol=1e-6).nonzero()[0]
+        bottom_points = np.isclose(points[:, 1], min_xyz[1], atol=1e-6).nonzero()[0]
+        top_points = np.isclose(points[:, 1], max_xyz[1], atol=1e-6).nonzero()[0]
+
+        # Calculate Box Dimensions
+        Lx = max_xyz[0] - min_xyz[0]
+        Ly = max_xyz[1] - min_xyz[1]
+        def map_boundary(slaves, masters, shift_vec):
+            slave_pts = points[slaves]
+            master_pts = points[masters]
+            target_pos = slave_pts - shift_vec
+            dists = cdist(target_pos, master_pts)
+            nearest_idx = np.argmin(dists, axis=1)
+            min_dists = dists[np.arange(len(dists)), nearest_idx]
+            
+            if not np.all(min_dists < tol):
+                raise ValueError("Geometric mismatch on periodic boundary")
+                
+            # Update the global map
+            dof_map[slaves] = masters[nearest_idx]
+    
+        # 1. Map Right -> Left (Shift x by -Lx)
+        map_boundary(right_points, left_points, np.array([Lx, 0.0]))
+        
+        # 2. Map Top -> Bottom (Shift y by -Ly)
+        map_boundary(top_points, bottom_points, np.array([0.0, Ly]))
+
+    elif p==3:
+        left_points = np.isclose(points[:, 0], min_xyz[0], atol=1e-6).nonzero()[0]
+        right_points = np.isclose(points[:, 0], max_xyz[0], atol=1e-6).nonzero()[0]
+        bottom_points = np.isclose(points[:, 1], min_xyz[1], atol=1e-6).nonzero()[0]
+        top_points = np.isclose(points[:, 1], max_xyz[1], atol=1e-6).nonzero()[0]
+        back_points = np.isclose(points[:, 2], min_xyz[2], atol=1e-6).nonzero()[0]
+        front_points = np.isclose(points[:, 2], max_xyz[2], atol=1e-6).nonzero()[0]
+        num_nodes = len(points)
+        dof_map = np.arange(num_nodes)
+    
+        # Calculate Box Dimensions for 3D
+        Lx = max_xyz[0] - min_xyz[0]
+        Ly = max_xyz[1] - min_xyz[1]
+        Lz = max_xyz[2] - min_xyz[2]
+        
+        def map_boundary(slaves, masters, shift_vec):
+            if len(slaves) == 0: return # Handle empty sets if boundary is empty
+            
+            slave_pts = points[slaves]
+            master_pts = points[masters]
+            target_pos = slave_pts - shift_vec
+
+            dists = cdist(target_pos, master_pts)
+            nearest_idx = np.argmin(dists, axis=1)
+            min_dists = dists[np.arange(len(dists)), nearest_idx]
+            
+            if not np.all(min_dists < tol):
+                raise ValueError(f"Geometric mismatch on periodic boundary with shift {shift_vec}")
+                
+            dof_map[slaves] = masters[nearest_idx]
+    
+        # 1. Map Right -> Left (Shift X)
+        map_boundary(right_points, left_points, np.array([Lx, 0.0, 0.0]))
+        
+        # 2. Map Top -> Bottom (Shift Y)
+        map_boundary(top_points, bottom_points, np.array([0.0, Ly, 0.0]))
+        
+        # 3. Map Front -> Back (Shift Z)
+        map_boundary(front_points, back_points, np.array([0.0, 0.0, Lz]))
+
+    for _ in range(p):
+            dof_map = dof_map[dof_map]
+        
+    node_periodic_map= jnp.array(dof_map)
+    master_nodes = node_periodic_map  
+    dof_offsets = jnp.arange(ndof_per_node)
+    master_dof_indices = master_nodes[:, None] * ndof_per_node + dof_offsets[None, :]    
+    return master_dof_indices.flatten()
