@@ -183,7 +183,14 @@ def mesh_to_jax(
     ]
     ```
     """
-    return jnp.array(mesh_to_jax_helper(vertices, cells))
+    # 1. Transfer the SMALL, compressed arrays to the GPU first
+    j_vertices = jnp.array(vertices)
+    j_cells = jnp.array(cells)
+    
+    # 2. Let the GPU instantly expand the coordinates 
+    # j_vertices[j_cells] automatically creates an array of shape (E, N, D)
+    x_end = j_vertices[j_cells]
+    return x_end
 
 
 @njit
@@ -301,9 +308,9 @@ def transform_global_to_element_node(
     ).reshape(E, V, U)
 
 
-@partial(jax.jit, static_argnames=["E"])
+@partial(jax.jit, static_argnames=["U"])
 def transform_global_unraveled_to_element_node(
-    assembly_map: jsparse.BCSR, v_g: jnp.ndarray, E: int
+    periodic_cells: jnp.ndarray, v_g: jnp.ndarray, U: int =3
 ):
     """
     Transforms a vector that represents a global assembled vector that is unraveled into the
@@ -311,43 +318,57 @@ def transform_global_unraveled_to_element_node(
 
     TODO: change this to transform into batches (keep batch info in Dimensions)
     """
-    assert assembly_map.shape[0] == 1
-    V = assembly_map.shape[1]
-    U = v_g.shape[0] // V
-    N = assembly_map.shape[2] // E
-    return jsparse.bcsr_dot_general(
-        assembly_map,
-        v_g.reshape(1, V, U),
-        dimension_numbers=(((1,), (1,)), ((0,), (0,))),
-    ).reshape(E, N, U)
+    return v_g.reshape(-1, U)[periodic_cells]
 
 
+@partial(jax.jit, static_argnames=["V"])
 def transform_element_node_to_global_unraveled_nosum(
-    assembly_map: jsparse.BCSR, v_en: jnp.ndarray
+    periodic_cells: jnp.ndarray, v_en: jnp.ndarray, V:int
 ):
     """
-    TODO document
+    Returns:
+        Flat 1D array of summed global contributions: (num_nodes * ndof,)
     """
-    n_cell_per_vert = (
-        assembly_map.indptr[0, 1:] - assembly_map.indptr[0, :-1]
-    )
+    ndof = v_en.shape[-1]
+    v_g_nodes = jnp.zeros((num_nodes, ndof), dtype=v_en.dtype)
+    v_g_nodes = v_g_nodes.at[periodic_cells].add(v_en)
+    return v_g_nodes.ravel()
+    
+   # n_cell_per_vert = (
+   #     assembly_map.indptr[0, 1:] - assembly_map.indptr[0, :-1]
+   # )
+   # v_g = jsparse.bcsr_dot_general(
+    #    assembly_map,
+    #    v_en.reshape(1, v_en.shape[0] * v_en.shape[1], v_en.shape[2]),
+    #    dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+   # )
+   # return (v_g / n_cell_per_vert[jnp.newaxis, :, jnp.newaxis]).reshape(
+   #     np.prod(v_g.shape)
+   # )
+@jax.jit
+def transform_element_node_to_global_unraveled_sum_sparse(
+    assembly_map: jsparse.BCSR, v_en: jnp.ndarray
+):
+    """Original sparse scatter to guarantee deterministic summation for Krylov solvers."""
     v_g = jsparse.bcsr_dot_general(
         assembly_map,
         v_en.reshape(1, v_en.shape[0] * v_en.shape[1], v_en.shape[2]),
         dimension_numbers=(((2,), (1,)), ((0,), (0,))),
     )
-    return (v_g / n_cell_per_vert[jnp.newaxis, :, jnp.newaxis]).reshape(
-        np.prod(v_g.shape)
-    )
+    return v_g.reshape(np.prod(v_g.shape))
+    
 
-
-@jax.jit
+@partial(jax.jit, static_argnames=["num_nodes"])
 def transform_element_node_to_global_unraveled_sum(
-    assembly_map: jsparse.BCSR, v_en: jnp.ndarray
+    periodic_cells: jnp.ndarray, v_en: jnp.ndarray, num_nodes:int, U: int=3, 
 ):
     """
     TODO document
     """
+    ndof = v_en.shape[-1]
+    v_g_nodes = jnp.zeros((num_nodes, ndof), dtype=v_en.dtype)
+    v_g_nodes = v_g_nodes.at[periodic_cells].add(v_en)
+    return v_g_nodes.ravel()
     v_g = jsparse.bcsr_dot_general(
         assembly_map,
         v_en.reshape(1, v_en.shape[0] * v_en.shape[1], v_en.shape[2]),
@@ -399,28 +420,16 @@ def mesh_to_periodic_sparse_assembly_map(
     points: jnp.ndarray,
     ndof_per_node: int = 3,
     tol=1e-6,
-    ) -> jsparse.BCSR:
+):
     dof_map_np = np.array(dof_map_full(points, tol))
-    ndof_per_node=3
     master_nodes = dof_map_np[:-3][::ndof_per_node] // ndof_per_node
     master_nodes = master_nodes.astype(np.uint64) 
-    
-    # 3. Create Periodic Connectivity
-    # Replace every slave node in the element definition with its master node
+
+    # This array is the golden ticket for GPU performance
     periodic_cells = master_nodes[np.array(cells, dtype=np.uint64)]
-    # 4. Build CSR arrays using your existing Numba functions
-    csr_row_ind = build_row_ind(V, periodic_cells) 
-    csr_col_ind, csr_data = build_col_ind_and_data(csr_row_ind, periodic_cells)
-    
-    csr_row_ind = csr_row_ind.reshape(1, -1)
-    csr_col_ind = csr_col_ind.reshape(1, -1)
-    csr_data = csr_data.reshape(1, -1)
-    return jsparse.BCSR(
-            (csr_data, csr_col_ind, csr_row_ind),
-            shape=(1, V, cells.shape[0] * cells.shape[1]),
-            indices_sorted=True,
-            unique_indices=True,
-        ), dof_map_np
+        
+    # Return periodic_cells as a JAX device array for fast indexing
+    return jnp.array(periodic_cells, dtype=jnp.int32), dof_map_np
         
 def periodic_map(points, tol=1e-6, ndof_per_node=3):
     min_xyz = np.min(points, axis=0)
