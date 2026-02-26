@@ -425,11 +425,21 @@ def mesh_to_periodic_sparse_assembly_map(
     master_nodes = dof_map_np[:-3][::ndof_per_node] // ndof_per_node
     master_nodes = master_nodes.astype(np.uint64) 
 
-    # This array is the golden ticket for GPU performance
-    periodic_cells = master_nodes[np.array(cells, dtype=np.uint64)]
-        
-    # Return periodic_cells as a JAX device array for fast indexing
-    return jnp.array(periodic_cells, dtype=jnp.int32), dof_map_np
+    # --- THE NEW COMPRESSION STEP ---
+    # 1. Find the strictly unique master nodes (This is exactly your reduced set)
+    unique_masters = np.unique(master_nodes)
+    
+    # 2. Create a translation array: Full Node ID -> Reduced Node ID
+    full_to_reduced = np.full(V, -1, dtype=np.int32)
+    full_to_reduced[unique_masters] = np.arange(len(unique_masters), dtype=np.int32)
+    
+    # 3. Map the original cells: Slave -> Master -> Reduced
+    # master_nodes[cells] gets the master ID. 
+    # full_to_reduced[...] converts it to the 0-indexed reduced space.
+    reduced_periodic_cells = full_to_reduced[master_nodes[cells]]
+    # --------------------------------
+
+    return jnp.array(reduced_periodic_cells, dtype=jnp.int32), dof_map_np
         
 def periodic_map(points, tol=1e-6, ndof_per_node=3):
     min_xyz = np.min(points, axis=0)

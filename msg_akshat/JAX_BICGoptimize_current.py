@@ -23,11 +23,14 @@ if not os.path.exists(cache_path):
 
 os.environ['JAX_COMPILATION_CACHE_DIR'] = cache_path
 os.environ['JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS'] = '0'
+os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
 
 start = time.time()
 #print(f"  Start Compute: {start:.4f}s")
 ############### User Input #################################
-name='Sandwich_SC_files/BCC/SW_2UC_45'
+name='Sandwich_SC_files/HC/HC_refined_45'
+#name='Sandwich_SC_files/RHC/RHC_Coarse_2UC_45'
+#name='Sandwich_SC_files/BCC/SW_2UC_45'
 
 material_param=jnp.array([(108e3,8e3,8e3,4e3,4e3,3e3,0.32,0.32,0.30),
                           (108e3,8e3,8e3,4e3,4e3,3e3,0.32,0.32,0.30),
@@ -38,9 +41,9 @@ angles = jnp.array([45, -45, 0.0]) # Put 0.0 if no angle used
 #####################################################
 
 
-num_sg=generate_msh_from_sc(name+'.sc', 'sg_mesh.msh')
+num_sg=generate_msh_from_sc(name+'.sc', 'sgmesh.msh')
 #num_sg=3
-mesh = meshio.read('sg_mesh.msh') 
+mesh = meshio.read('sgmesh.msh') 
 points = jnp.array(mesh.points, dtype=np.float32)[:,0:num_sg]
 cells = jnp.array(mesh.cells[0].data, dtype=np.uint64) 
 
@@ -58,7 +61,7 @@ fe_type = FiniteElementType(
     basis_degree=1,
     lagrange_variant=LagrangeVariant.equispaced,
     quadrature_type=QuadratureType.default,
-    quadrature_degree=3,
+    quadrature_degree=6,
 )
 
 def build_single_C_matrix(params):
@@ -180,9 +183,9 @@ def calculate_residual_batch_element_kernel_mixed_periodic(
     C_ess: jnp.ndarray,
     periodic_cells, # Use the periodic map!
     unique_dofs_full: jnp.ndarray, # Pass your unique indices (including Lagrange)
-    u_f: jnp.ndarray,   
+    u_red: jnp.ndarray,   
 ):
-    u_g_flat, lamb_vec = u_f[:-3], u_f[-3:]
+    u_g_flat, lamb_vec = u_red[:-3], u_red[-3:]
     
     #E=x_end.shape[0]
     u_end = transform_global_unraveled_to_element_node(periodic_cells, u_g_flat, U=3)
@@ -213,12 +216,12 @@ def calculate_residual_batch_element_kernel_mixed_periodic(
     R_elastic_matrix = R_global_cases.reshape(6, -1).T
     constraint_rhs = jnp.zeros((3, 6))
     R_mixed_matrix = jnp.concatenate([R_elastic_matrix, constraint_rhs], axis=0)
-    return R_mixed_matrix[unique_dofs_full]
+    return R_mixed_matrix
 
 @jax.jit
 def _calculate_jacobian_batch_element_kernel_periodic(
     x_end: jnp.ndarray,
-    u_mixed_f,
+    u_red,
     dphi_dxi_qnp: jnp.ndarray,
     phi_qn: jnp.ndarray,          
     W_q: jnp.ndarray,
@@ -226,8 +229,8 @@ def _calculate_jacobian_batch_element_kernel_periodic(
     periodic_cells: object,
 ):
     E = x_end.shape[0]
-    u_f = u_mixed_f[:-3]
-    lamb_f = u_mixed_f[-3:] 
+    u_f = u_red[:-3]
+    lamb_f = u_red[-3:] 
     u_enu = transform_global_unraveled_to_element_node(periodic_cells, u_f)
 
     N = x_end.shape[1]
@@ -265,13 +268,11 @@ def _calculate_jacobian_batch_element_kernel_periodic(
 
 def ebe_jacobian_product_periodic(
     J_uu, J_ulamb, J_lambu, J_lamblamb,
-    periodic_cells: jnp.ndarray, unique_dofs: jnp.ndarray, n_total_dofs: int,  z_reduced: jnp.ndarray
+    periodic_cells: jnp.ndarray, n_unique_u: int, z_reduced: jnp.ndarray
 ):
-    z_full = jnp.zeros(n_total_dofs).at[unique_dofs].set(z_reduced, unique_indices=True)
-
     # 1. SPLIT z_global
-    z_u = z_full[:-3]    # Displacement part
-    z_lamb = z_full[-3:] # Lagrange multiplier part
+    z_u = z_reduced[:n_unique_u]     # Displacement part
+    z_lamb = z_reduced[n_unique_u:]  # Lagrange multiplier part (last 3)
 
     z_u_enu = transform_global_unraveled_to_element_node(
         periodic_cells, z_u
@@ -279,26 +280,21 @@ def ebe_jacobian_product_periodic(
     _,N,U=z_u_enu.shape
     z_u_local = z_u_enu.reshape(-1, N*U)
 
-    # 5. SCATTER: Local forces to Global vector
-    # Separate the results: f_u is (E, 9), f_lamb is (E, 3)
     f_u_local_flat = jnp.einsum('eij,ej->ei', J_uu, z_u_local) + \
                      jnp.einsum('eij,j->ei', J_ulamb, z_lamb)
     
     f_u_local = f_u_local_flat.reshape(-1, N, U)
     f_lamb_global = jnp.einsum('eij,ej->i', J_lambu, z_u_local) + \
                     jnp.sum(jnp.matmul(J_lamblamb, z_lamb), axis=0)
-                    # jnp.einsum('eij,j->i', J_lamblamb, z_lamb)
                      
     f_u_global_full = transform_element_node_to_global_unraveled_sum(
-        periodic_cells=periodic_cells, v_en=f_u_local, num_nodes=z_u.shape[0] // U,
+        periodic_cells=periodic_cells, v_en=f_u_local, num_nodes=n_unique_u // U,
     )
-    # Sum the element-level Lagrange contributions into the final 3 slots
- #   f_lamb_global = jnp.sum(f_lamb_local, axis=0)
 
-    return jnp.concatenate([f_u_global_full, f_lamb_global])[unique_dofs]
+    return jnp.concatenate([f_u_global_full, f_lamb_global])
     
-@partial(jax.jit, static_argnames=["n_total_dofs"])
-def compute_block_inv_diag(J_uu, periodic_cells, n_total_dofs):
+@partial(jax.jit, static_argnames=["n_unique"])
+def compute_block_inv_diag(J_uu, periodic_cells, n_unique):
     E, n_u, _ = J_uu.shape
     N = n_u // 3
     
@@ -313,13 +309,12 @@ def compute_block_inv_diag(J_uu, periodic_cells, n_total_dofs):
     local_3x3_blocks = jnp.moveaxis(local_3x3_blocks, -1, 1) 
     
     # 2. Scatter-add to form the global nodal 3x3 matrices
-    num_nodes = (n_total_dofs - 3) // 3
-    global_blocks = jnp.zeros((num_nodes, 3, 3))
+    num_unique = n_unique // 3
+    global_blocks = jnp.zeros((num_unique, 3, 3))
     global_blocks = global_blocks.at[periodic_cells].add(local_3x3_blocks)
     
     # 3. Invert the 3x3 blocks directly on the GPU
-    # Add a tiny epsilon to the diagonal of the blocks to prevent singular matrices
-    I_3x3 = jnp.eye(3)
+    I_3x3 = jnp.eye(3)[None, :, :]
     global_blocks_safe = global_blocks + I_3x3 * 1e-8
     
     # jnp.linalg.inv automatically batches over the first dimension!
@@ -331,25 +326,24 @@ def compute_block_inv_diag(J_uu, periodic_cells, n_total_dofs):
     return inv_global_blocks, mean_stiffness
 
 # --- Define the Block Preconditioner Apply Function ---
-@partial(jax.jit, static_argnames=["n_total"])
-def apply_block_precond(inv_blocks, mean_stiff, unique_dofs_full, n_total, x_reduced):
-    # Expand to full vector
-    x_full = jnp.zeros(n_total).at[unique_dofs_full].set(x_reduced, unique_indices=True)
-    
-    x_u = x_full[:-3]
-    x_lamb = x_full[-3:]
+
+@partial(jax.jit, static_argnames=["n_unique_u"])
+def apply_block_precond(inv_blocks, mean_stiff, n_unique_u, x_reduced):
+ 
+    x_u = x_reduced[:n_unique_u]
+    x_lamb = x_reduced[n_unique_u:]
     
     # Apply 3x3 block matrix multiplication to each node
     x_u_nodes = x_u.reshape(-1, 3)
     # Multiply each 3x3 matrix by the corresponding 3x1 node vector
+
     precond_u_nodes = jnp.einsum('nij,nj->ni', inv_blocks, x_u_nodes)
     precond_u = precond_u_nodes.ravel()
     
     # Apply scalar preconditioner to Lagrange multipliers
     precond_lamb = x_lamb / (mean_stiff + 1e-12)
-    
-    precond_full = jnp.concatenate([precond_u, precond_lamb])
-    return precond_full[unique_dofs_full]
+     
+    return jnp.concatenate([precond_u, precond_lamb])
 
 # 4. Compute D1
 def compute_effective_properties(
@@ -376,67 +370,72 @@ def compute_effective_properties(
     D_bar = jnp.einsum('eij,e->ij', C_ess, elem_vols)
 
     # 4. Effective Stiffness
-    D_eff = (D_bar + D1) / omega
+    C_eff = (D_bar + D1) / omega
 
     # 5. Invert for Compliance (jnp.linalg.inv is fine for 6x6)
-    I = jnp.eye(6, dtype=D_eff.dtype)
-    Com = jnp.linalg.solve(D_eff, I)
-
+    I = jnp.eye(6, dtype=C_eff.dtype)
+    Com = jnp.linalg.solve(C_eff, I)
+  
     # 6. Extract Engineering Constants on the GPU
     E1, E2, E3 = 1/Com[0,0], 1/Com[1,1], 1/Com[2,2]
     v12, v13, v23 = -Com[0,1]/Com[0,0], -Com[0,2]/Com[0,0], -Com[1,2]/Com[1,1]
     G23, G13, G12 = 1/Com[3,3], 1/Com[4,4], 1/Com[5,5]
 
-    return D_eff, jnp.array([E1, E2, E3, G23, G13, G12,v12, v13, v23])
-
-@partial(jax.jit, static_argnames=['n_total'])
+    return C_eff, jnp.array([E1, E2, E3, G12, G13, G23,v12, v13, v23])
+#########################################################################
+@partial(jax.jit, static_argnames=['n_unique'])
 def full_homogenization_pipeline(
     x_end, u_0_g, dphi_dxi_qnp, phi_qn, W_q, 
-    periodic_cells, unique_dofs, n_total
+    periodic_cells, unique_dofs, n_unique
 ):
     #t0 = time.time()
     C_ess = get_heterogeneous_C_matrix(cell_domain_ids, num_quad_points=Q, 
     material_param=material_param, domain_angles=angles
     )
+    C_ess = C_ess.astype(jnp.float32)
     print(f"  Material Prop. : {time.time()-start:.4f}s")
-
     #t1 = time.time()
     R_f_reduced = calculate_residual_batch_element_kernel_mixed_periodic(
-        x_end, dphi_dxi_qnp, phi_qn, W_q, C_ess, periodic_cells, unique_dofs, u_0_g_full
+        x_end, dphi_dxi_qnp, phi_qn, W_q, C_ess, periodic_cells, 
+        unique_dofs, u_0_g_full[unique_dofs]
     )
+
     print(f"  Residual Build: {time.time()-start:.4f}s")
 
     #t2 = time.time()
     J_ett = _calculate_jacobian_batch_element_kernel_periodic(
-        x_end, u_0_g_full, dphi_dxi_qnp, phi_qn, W_q, C_ess, periodic_cells
+        x_end, u_0_g_full[unique_dofs], dphi_dxi_qnp, phi_qn, W_q, C_ess, periodic_cells
     )
     print(f"  Jacobian Build: {time.time()-start:.4f}s")
 
     #t6 = time.time()
-    N, U = periodic_cells.shape[1], 3
-    n_u = N * U
-    J_uu = J_ett[:, :n_u, :n_u]
-    J_ulamb = J_ett[:, :n_u, n_u:]
-    J_lambu = J_ett[:, n_u:, :n_u]
-    J_lamblamb = J_ett[:, n_u:, n_u:]
+    NU = J_ett.shape[1] - 3
+
+    # 2. Slice using explicit positive bounds
+    J_uu       = J_ett[:, :NU, :NU]    # Shape: (E, NU, NU)
+    J_ulamb    = J_ett[:, :NU, NU:]    # Shape: (E, NU, 3) 
+    J_lambu    = J_ett[:, NU:, :NU]    # Shape: (E, 3, NU)
+    J_lamblamb = J_ett[:, NU:, NU:]    # Shape: (E, 3, 3)
+     
     # 3. Solver Prep
     #t3 = time.time()
-    inv_blocks, mean_s = compute_block_inv_diag(J_uu, periodic_cells, n_total)
+    inv_blocks, mean_s = compute_block_inv_diag(J_uu, periodic_cells, n_unique)
     print(f"  Preconditioner time: {time.time()-start:.4f}s")
-
+ 
     def solve_inner(b_col):
-        M = jax.tree_util.Partial(apply_block_precond, inv_blocks, mean_s, unique_dofs, n_total)
+        M = jax.tree_util.Partial(apply_block_precond, inv_blocks, mean_s, n_unique)
         A_op = jax.tree_util.Partial(ebe_jacobian_product_periodic, 
-                                    J_uu, J_ulamb, J_lambu, J_lamblamb, 
-                                    periodic_cells, unique_dofs, n_total)
+                                  J_uu, J_ulamb, J_lambu, J_lamblamb, 
+                                  periodic_cells, n_unique)
         
-        # Lowering tol to 1e-4 can save 0.5s of solver time
-        res, _ = jax.scipy.sparse.linalg.bicgstab(A_op, b_col, M=M, tol=1e-5, atol=1e-5)
+        res, _ = jax.scipy.sparse.linalg.bicgstab(A_op, b_col,M=M, tol=1e-6, atol=1e-6,
+        maxiter=1200)
         return res
 
     #t4 = time.time()
     # 4. Solve all 6 cases
     delta_u_matrix = jax.lax.map(solve_inner, -R_f_reduced.T).T
+    
     print(f"  Linear Solver: {time.time()-start:.4f}s")
     # 3. Post-Processing (Fused)
 
@@ -446,7 +445,7 @@ def full_homogenization_pipeline(
     )
     print(f"  D_eff process: {time.time()-start:.4f}s")
     return D_eff, constants
-
+##########################################################################
 #t7 = time.time()
 xi_qp, W_q = get_quadrature(fe_type=fe_type)
 phi_qn, dphi_dxi_qnp = eval_basis_and_derivatives(fe_type=fe_type, xi_qp=xi_qp)
@@ -463,14 +462,15 @@ print(f"  Quadrature i/p: {time.time()-start:.4f}s")
 
 periodic_cells, dof_map_np = mesh_to_periodic_sparse_assembly_map(V, cells, points,tol=1e-6)
 unique_dofs = jnp.unique(dof_map_np)
-n_total_dofs = len(dof_map_np)
+n_unique=len(unique_dofs)-3
 u_0_g_full = jnp.zeros(shape=(V * U + 3)) 
 
 print(f"  Periodic map : {time.time()-start:.4f}s")
-D_eff, props = full_homogenization_pipeline(
+C_eff, props = full_homogenization_pipeline(
     x_end, u_0_g_full, dphi_dxi_qnp, phi_qn, W_q,  
-    periodic_cells, unique_dofs, n_total_dofs
+    periodic_cells, unique_dofs, n_unique
 )    
+C_eff.block_until_ready()
 print(f" \n Total Time taken: {time.time()-start:.4f}s")  
 
 labels = ["E1", "E2", "E3", "G12", "G13", "G23", "v12", "v13", "v23"];
@@ -478,6 +478,6 @@ print("--- Effective Material Properties ---")
 for label, val in zip(labels, props):
     print(f"{label}: {val}")
 print('\n Effective Stiffness matrix \n')
-print(D_eff)
+print(C_eff)
 
 
