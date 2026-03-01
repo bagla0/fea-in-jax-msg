@@ -447,7 +447,33 @@ def periodic_map(points, tol=1e-6, ndof_per_node=3):
     num_nodes = len(points)
     dof_map = np.arange(num_nodes)
     p=points.shape[1]
-    if p==2:
+    if p == 1:
+        left_points = np.isclose(points[:, 0], min_xyz[0], atol=1e-6).nonzero()[0]
+        right_points = np.isclose(points[:, 0], max_xyz[0], atol=1e-6).nonzero()[0]
+
+        # Calculate Box Dimensions for 1D
+        Lx = max_xyz[0] - min_xyz[0]
+        
+        def map_boundary(slaves, masters, shift_vec):
+            if len(slaves) == 0: return # Handle empty sets if boundary is empty
+            
+            slave_pts = points[slaves]
+            master_pts = points[masters]
+            target_pos = slave_pts - shift_vec
+            
+            dists = cdist(target_pos, master_pts)
+            nearest_idx = np.argmin(dists, axis=1)
+            min_dists = dists[np.arange(len(dists)), nearest_idx]
+            
+            if not np.all(min_dists < tol):
+                raise ValueError("Geometric mismatch on periodic boundary")
+                
+            # Update the global map
+            dof_map[slaves] = masters[nearest_idx]
+
+        # 1. Map Right -> Left (Shift x by Lx)
+        map_boundary(right_points, left_points, np.array([Lx]))
+    elif p==2:
         left_points = np.isclose(points[:, 0], min_xyz[0], atol=1e-6).nonzero()[0]
         right_points = np.isclose(points[:, 0], max_xyz[0], atol=1e-6).nonzero()[0]
         bottom_points = np.isclose(points[:, 1], min_xyz[1], atol=1e-6).nonzero()[0]

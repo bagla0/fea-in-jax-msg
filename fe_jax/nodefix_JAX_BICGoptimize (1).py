@@ -25,6 +25,7 @@ cache_path = os.path.abspath("./jax_cache")
 if not os.path.exists(cache_path):
     os.makedirs(cache_path)
 
+
 os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
 os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '.80'
 os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'platform'
